@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+build/
+out/
+
+*.iml
+*.log
+
+.env
+.idea/
+.vscode/
+
+credentials.json
+__pycache__/
+*.pyc
