@@ -998,13 +998,90 @@ fun Application.registerRoutes() {
                     val request = call.receive<LocoSendMessageRequest>()
                     useLocoClient { client ->
                         client.fullConnect()
+                        val payload =
+                            if (request.mentionAll) {
+                                client.buildMentionAllPayload(
+                                    chatId = request.chatId,
+                                    trailingMessage = request.message,
+                                    includeSelf = request.includeSelf,
+                                )
+                            } else {
+                                LocoClient.MentionPayload(
+                                    message = request.message,
+                                    mentions =
+                                        request.mentions.map { mention ->
+                                            LocoClient.Mention(
+                                                userId = mention.userId,
+                                                at = mention.at,
+                                                len = mention.len,
+                                            )
+                                        },
+                                    members = emptyList(),
+                                )
+                            }
                         call.respond(
                             client.sendTextMessage(
                                 chatId = request.chatId,
-                                message = request.message,
+                                message = payload.message,
+                                mentions = payload.mentions,
                                 allowOpenChatUnsafe = request.allowOpenChatUnsafe,
                             ),
                         )
+                    }
+                }
+
+                post("/messages/send-mention-all") {
+                    val request = call.receive<LocoSendMentionAllRequest>()
+                    useLocoClient { client ->
+                        client.fullConnect()
+                        val matches = client.findChatsByTitle(request.chatTitle, request.exactMatch)
+                        when {
+                            matches.isEmpty() -> {
+                                call.respond(
+                                    HttpStatusCode.NotFound,
+                                    mapOf("error" to "chat room not found", "title" to request.chatTitle),
+                                )
+                            }
+
+                            matches.size > 1 -> {
+                                call.respond(
+                                    HttpStatusCode.Conflict,
+                                    mapOf(
+                                        "error" to "multiple chats matched",
+                                        "title" to request.chatTitle,
+                                        "candidates" to matches,
+                                    ),
+                                )
+                            }
+
+                            else -> {
+                                val room = matches.single()
+                                val payload =
+                                    client.buildMentionAllPayload(
+                                        chatId = room.chatId,
+                                        trailingMessage = request.message,
+                                        includeSelf = request.includeSelf,
+                                    )
+                                val response =
+                                    client.sendTextMessage(
+                                        chatId = room.chatId,
+                                        message = payload.message,
+                                        mentions = payload.mentions,
+                                        allowOpenChatUnsafe = request.allowOpenChatUnsafe,
+                                    )
+                                call.respond(
+                                    LocoSendMentionAllResponse(
+                                        success = true,
+                                        chatId = room.chatId,
+                                        title = room.title,
+                                        mentionedCount = payload.members.size,
+                                        mentionedUserIds = payload.members.map { it.userId },
+                                        composedMessage = payload.message,
+                                        response = response,
+                                    ),
+                                )
+                            }
+                        }
                     }
                 }
 

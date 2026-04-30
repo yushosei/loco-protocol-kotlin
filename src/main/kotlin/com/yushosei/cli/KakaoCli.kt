@@ -23,7 +23,7 @@ object KakaoCli {
     private const val checkinWatchKinds = "runtime_log,http_request,keyword,tcp_connection"
     private const val checkinWatchKeywords = "ticket-loco.kakao.com,booking-loco.kakao.com,CHECKIN,GETCONF,LOGINLIST"
     private const val checkinWatchRuntimeContains = "CHECKIN,GETCONF,LOGINLIST,ticket-loco,booking-loco,handshake,secure,tls,ssl,connect,port"
-    private const val defaultAuthAppVersion = "3.2.3.2698"
+    private const val fallbackAuthAppVersion = "25.10.1"
     private const val defaultAuthAgent = "win32"
     private const val defaultAuthOsVersion = "10.0"
     private const val defaultAuthLanguage = "ko"
@@ -71,6 +71,7 @@ object KakaoCli {
                 "room", "chat" -> handleRoom(parsed)
                 "read" -> handleRead(parsed)
                 "send" -> handleSend(parsed)
+                "mention-all-room", "mention-all", "send-mention-all" -> handleMentionAllRoom(parsed)
                 "settings" -> handleSettings()
                 "profile" -> handleProfile()
                 "friends" -> handleFriends()
@@ -108,27 +109,25 @@ object KakaoCli {
         val verifyRest = parsed.booleanOption("verify-rest", refresh)
 
         val candidates = KakaoCredentialExtractor.getCredentialCandidates(maxCandidates)
-        val selected = candidates.firstOrNull()
-        val refreshed = refreshExtractedCredentials(selected, refresh)
-        val resolved = backfillUserIdFromRest(refreshed.credentials)
-        val restVerified = verifyRestLogin(resolved, verifyRest)
-        val shouldPersist = save && canPersistCredentials(resolved, restVerified)
+        val stored = CredentialsStore.load()
+        val selected = selectBestCredentialCandidate(candidates, stored, refresh, verifyRest)
+        val shouldPersist = save && canPersistExtractedCredentials(selected, verifyRest)
 
-        if (shouldPersist && resolved != null) {
-            CredentialsStore.save(resolved)
+        if (shouldPersist && selected.credentials != null) {
+            CredentialsStore.save(selected.credentials)
         }
 
         printJson(
             CredentialsExtractResponse(
-                saved = shouldPersist && resolved != null,
-                refreshed = refreshed.refreshed,
-                refreshStatus = refreshed.refreshStatus,
-                restVerified = restVerified,
-                selected = resolved,
+                saved = shouldPersist && selected.credentials != null,
+                refreshed = selected.refreshed,
+                refreshStatus = selected.refreshStatus,
+                restVerified = selected.restVerified,
+                selected = selected.credentials,
                 candidates = candidates,
             ),
         )
-        return if (resolved != null) 0 else 1
+        return if (selected.credentials != null) 0 else 1
     }
 
     private fun handleCredentials(): Int {
@@ -193,14 +192,15 @@ object KakaoCli {
                 deviceName = parsed.stringOption("device-name"),
                 useCachedParams = parsed.booleanOption("use-cached-params", true),
             )
+        val authTemplate = resolveDefaultAuthTemplate()
         val provisional =
             buildProvisionalCredentials(
-                appVersion = parsed.stringOption("app-version") ?: defaultAuthAppVersion,
+                appVersion = parsed.stringOption("app-version") ?: authTemplate?.appVersion ?: fallbackAuthAppVersion,
                 agent = parsed.stringOption("agent") ?: defaultAuthAgent,
                 osVersion = parsed.stringOption("os-version") ?: defaultAuthOsVersion,
                 language = parsed.stringOption("language") ?: defaultAuthLanguage,
-                userAgent = parsed.stringOption("user-agent"),
-                aHeader = parsed.stringOption("a-header"),
+                userAgent = parsed.stringOption("user-agent") ?: authTemplate?.userAgent,
+                aHeader = parsed.stringOption("a-header") ?: authTemplate?.aHeader,
                 deviceUuid = resolved.deviceUuid,
                 deviceName = resolved.deviceName,
             )
@@ -251,14 +251,15 @@ object KakaoCli {
                 deviceName = parsed.stringOption("device-name"),
                 useCachedParams = parsed.booleanOption("use-cached-params", true),
             )
+        val authTemplate = resolveDefaultAuthTemplate()
         val provisional =
             buildProvisionalCredentials(
-                appVersion = parsed.stringOption("app-version") ?: defaultAuthAppVersion,
+                appVersion = parsed.stringOption("app-version") ?: authTemplate?.appVersion ?: fallbackAuthAppVersion,
                 agent = parsed.stringOption("agent") ?: defaultAuthAgent,
                 osVersion = parsed.stringOption("os-version") ?: defaultAuthOsVersion,
                 language = parsed.stringOption("language") ?: defaultAuthLanguage,
-                userAgent = parsed.stringOption("user-agent"),
-                aHeader = parsed.stringOption("a-header"),
+                userAgent = parsed.stringOption("user-agent") ?: authTemplate?.userAgent,
+                aHeader = parsed.stringOption("a-header") ?: authTemplate?.aHeader,
                 deviceUuid = resolved.deviceUuid,
                 deviceName = resolved.deviceName,
             )
@@ -295,14 +296,15 @@ object KakaoCli {
                 deviceName = parsed.stringOption("device-name"),
                 useCachedParams = parsed.booleanOption("use-cached-params", true),
             )
+        val authTemplate = resolveDefaultAuthTemplate()
         val provisional =
             buildProvisionalCredentials(
-                appVersion = parsed.stringOption("app-version") ?: defaultAuthAppVersion,
+                appVersion = parsed.stringOption("app-version") ?: authTemplate?.appVersion ?: fallbackAuthAppVersion,
                 agent = parsed.stringOption("agent") ?: defaultAuthAgent,
                 osVersion = parsed.stringOption("os-version") ?: defaultAuthOsVersion,
                 language = parsed.stringOption("language") ?: defaultAuthLanguage,
-                userAgent = parsed.stringOption("user-agent"),
-                aHeader = parsed.stringOption("a-header"),
+                userAgent = parsed.stringOption("user-agent") ?: authTemplate?.userAgent,
+                aHeader = parsed.stringOption("a-header") ?: authTemplate?.aHeader,
                 deviceUuid = resolved.deviceUuid,
                 deviceName = resolved.deviceName,
             )
@@ -457,10 +459,26 @@ object KakaoCli {
         }
 
     private fun handleRooms(parsed: ParsedArgs): Int =
-        useConnectedLocoClient { client ->
-            val limit = parsed.intOption("limit", 50).coerceAtLeast(1)
-            printJson(client.listChats().take(limit))
-            0
+        runCatching {
+            useConnectedLocoClient { client ->
+                val limit = parsed.intOption("limit", 50).coerceAtLeast(1)
+                printJson(filterLocoRoomsByTitle(client.listChats(), parsed).take(limit))
+                0
+            }
+        }.getOrElse { error ->
+            if (!isLocoLoginRejected(error)) {
+                throw error
+            }
+            System.err.println("LOCO chat list unavailable; falling back to REST chats")
+            runCatching {
+                useStoredRestClient { client ->
+                    val limit = parsed.intOption("limit", 50).coerceAtLeast(1)
+                    printJson(filterRestRoomsByTitle(client.getAllChats(), parsed).take(limit))
+                    0
+                }
+            }.getOrElse { restError ->
+                error("REST chat list fallback failed: ${restError.message ?: restError::class.simpleName}")
+            }
         }
 
     private fun handleRoom(parsed: ParsedArgs): Int =
@@ -498,8 +516,84 @@ object KakaoCli {
                 parsed.stringOption("message")
                     ?: parsed.positional.drop(1).joinToString(" ").takeIf { it.isNotBlank() }
                     ?: error("message is required")
+            val mentionAll = parsed.booleanOption("mention-all", false)
+            val includeSelf = parsed.booleanOption("include-self", false)
+            val payload =
+                if (mentionAll) {
+                    client.buildMentionAllPayload(
+                        chatId = chatId,
+                        trailingMessage = message,
+                        includeSelf = includeSelf,
+                    )
+                } else {
+                    LocoClient.MentionPayload(
+                        message = message,
+                        mentions = parseMentions(parsed),
+                        members = emptyList(),
+                    )
+                }
             val allowOpenChatUnsafe = parsed.booleanOption("allow-open-chat-unsafe", false)
-            printJson(client.sendTextMessage(chatId, message, allowOpenChatUnsafe))
+            printJson(
+                client.sendTextMessage(
+                    chatId = chatId,
+                    message = payload.message,
+                    mentions = payload.mentions,
+                    allowOpenChatUnsafe = allowOpenChatUnsafe,
+                ),
+            )
+            0
+        }
+
+    private fun handleMentionAllRoom(parsed: ParsedArgs): Int =
+        useConnectedLocoClient { client ->
+            val title =
+                parsed.stringOption("title")
+                    ?: parsed.positional.getOrNull(0)
+                    ?: error("title is required")
+            val message =
+                parsed.stringOption("message")
+                    ?: parsed.positional.drop(1).joinToString(" ").takeIf { it.isNotBlank() }
+                    ?: "ㅎㅇ"
+            val exactMatch = !parsed.booleanOption("contains", false)
+            val includeSelf = parsed.booleanOption("include-self", false)
+            val allowOpenChatUnsafe = parsed.booleanOption("allow-open-chat-unsafe", false)
+
+            val matches = client.findChatsByTitle(title, exactMatch)
+            val room =
+                when {
+                    matches.isEmpty() -> error("chat room not found: $title")
+                    matches.size > 1 -> {
+                        val candidates = matches.joinToString(" | ") { "${it.chatId}:${it.title}" }
+                        error("multiple chats matched: $candidates")
+                    }
+
+                    else -> matches.single()
+                }
+
+            val payload =
+                client.buildMentionAllPayload(
+                    chatId = room.chatId,
+                    trailingMessage = message,
+                    includeSelf = includeSelf,
+                )
+            val response =
+                client.sendTextMessage(
+                    chatId = room.chatId,
+                    message = payload.message,
+                    mentions = payload.mentions,
+                    allowOpenChatUnsafe = allowOpenChatUnsafe,
+                )
+            printJson(
+                CliMentionAllResult(
+                    success = true,
+                    chatId = room.chatId,
+                    title = room.title,
+                    mentionedCount = payload.members.size,
+                    mentionedUserIds = payload.members.map { it.userId },
+                    composedMessage = payload.message,
+                    response = response,
+                ),
+            )
             0
         }
 
@@ -637,7 +731,7 @@ object KakaoCli {
         return LocoClient(stored).use { client ->
             val login = client.fullConnect()
             login.statusOrNull()?.takeIf { it != 0L }?.let { status ->
-                error("LOCO login failed with status=$status; run `bootstrap` first")
+                error("LOCO login failed with status=$status; bootstrap may have completed, but LOGINLIST rejected the current credentials")
             }
             block(client)
         }
@@ -678,6 +772,63 @@ object KakaoCli {
         }.getOrElse { credentials }
     }
 
+    private fun parseMentions(parsed: ParsedArgs): List<LocoClient.Mention> {
+        val userIds = parsed.longListOption("mention-user-id")
+        if (userIds.isEmpty()) {
+            return emptyList()
+        }
+        val ats = parsed.intListOption("mention-at")
+        val lens = parsed.intListOption("mention-len")
+        require(userIds.size == ats.size && userIds.size == lens.size) {
+            "mention-user-id, mention-at, mention-len must have the same item count"
+        }
+        return userIds.indices.map { index ->
+            LocoClient.Mention(
+                userId = userIds[index],
+                at = listOf(ats[index]),
+                len = lens[index],
+            )
+        }
+    }
+
+    private fun filterRestRoomsByTitle(
+        rooms: List<com.yushosei.model.ChatRoom>,
+        parsed: ParsedArgs,
+    ): List<com.yushosei.model.ChatRoom> {
+        val query = parsed.stringOption("query") ?: parsed.stringOption("title") ?: return rooms
+        val needle = query.trim()
+        if (needle.isBlank()) {
+            return rooms
+        }
+        val exactMatch = parsed.booleanOption("exact-match", false)
+        return rooms.filter { room ->
+            if (exactMatch) {
+                room.title.trim() == needle
+            } else {
+                room.title.contains(needle, ignoreCase = true)
+            }
+        }
+    }
+
+    private fun filterLocoRoomsByTitle(
+        rooms: List<com.yushosei.model.LocoChatListing>,
+        parsed: ParsedArgs,
+    ): List<com.yushosei.model.LocoChatListing> {
+        val query = parsed.stringOption("query") ?: parsed.stringOption("title") ?: return rooms
+        val needle = query.trim()
+        if (needle.isBlank()) {
+            return rooms
+        }
+        val exactMatch = parsed.booleanOption("exact-match", false)
+        return rooms.filter { room ->
+            if (exactMatch) {
+                room.title.trim() == needle
+            } else {
+                room.title.contains(needle, ignoreCase = true)
+            }
+        }
+    }
+
     private fun resolveManualLoginContext(
         email: String?,
         password: String?,
@@ -701,6 +852,14 @@ object KakaoCli {
             usedCachedParams = cached != null,
         )
     }
+
+    private fun resolveDefaultAuthTemplate(): KakaoCredentials? =
+        listOfNotNull(
+            CredentialsStore.load(),
+            KakaoCredentialExtractor.getCredentialCandidates(1).firstOrNull(),
+        ).firstOrNull { candidate ->
+            candidate.appVersion.isNotBlank() || candidate.userAgent.isNotBlank() || candidate.aHeader.isNotBlank()
+        }
 
     private fun buildProvisionalCredentials(
         appVersion: String,
@@ -754,11 +913,11 @@ object KakaoCli {
             return stored!!
         }
         val candidates = KakaoCredentialExtractor.getCredentialCandidates(5)
-        val selected = candidates.firstOrNull() ?: error("no stored credentials and no live session found; run `extract` first")
-        val extracted =
-            backfillUserIdFromRest(
-                refreshExtractedCredentials(selected, enabled = true).credentials ?: selected,
-            ) ?: selected
+        if (candidates.isEmpty()) {
+            error("no stored credentials and no live session found; run `extract` first")
+        }
+        val extracted = selectBestCredentialCandidate(candidates, stored, refresh = true, verifyRest = true).credentials
+            ?: error("no usable credentials found; run `bootstrap` first")
         val preferred =
             listOfNotNull(stored, extracted)
                 .maxByOrNull(::credentialScore)
@@ -788,6 +947,9 @@ object KakaoCli {
             null
         }
 
+    private fun isLocoLoginRejected(error: Throwable): Boolean =
+        (error.message ?: "").contains("status=-950")
+
     private fun canPersistCredentials(credentials: KakaoCredentials?, restVerified: Boolean?): Boolean =
         credentials != null &&
             (
@@ -795,6 +957,83 @@ object KakaoCli {
                     restVerified == true ||
                     !credentials.refreshToken.isNullOrBlank()
             )
+
+    private fun canPersistExtractedCredentials(
+        selected: EvaluatedCandidate,
+        verifyRest: Boolean,
+    ): Boolean {
+        val credentials = selected.credentials ?: return false
+        if (!credentials.refreshToken.isNullOrBlank()) {
+            return true
+        }
+        if (verifyRest) {
+            return selected.restVerified == true
+        }
+        return credentials.userId > 0L
+    }
+
+    private fun selectBestCredentialCandidate(
+        candidates: List<KakaoCredentials>,
+        stored: KakaoCredentials?,
+        refresh: Boolean,
+        verifyRest: Boolean,
+    ): EvaluatedCandidate {
+        if (candidates.isEmpty()) {
+            return EvaluatedCandidate()
+        }
+
+        return candidates
+            .map { candidate -> evaluateCredentialCandidate(candidate, stored, refresh, verifyRest) }
+            .maxWithOrNull(
+                compareBy<EvaluatedCandidate>(
+                    { it.restVerified == true },
+                    { it.credentials?.userId ?: 0L > 0L },
+                    { !it.credentials?.refreshToken.isNullOrBlank() },
+                    { credentialScore(it.credentials) },
+                ),
+            ) ?: EvaluatedCandidate()
+    }
+
+    private fun evaluateCredentialCandidate(
+        candidate: KakaoCredentials,
+        stored: KakaoCredentials?,
+        refresh: Boolean,
+        verifyRest: Boolean,
+    ): EvaluatedCandidate {
+        val refreshed = refreshExtractedCredentials(candidate, refresh)
+        val resolved =
+            backfillUserIdFromStored(
+                backfillUserIdFromRest(refreshed.credentials),
+                stored,
+            )
+        val restVerified = verifyRestLogin(resolved, verifyRest)
+        return EvaluatedCandidate(
+            credentials = resolved,
+            refreshed = refreshed.refreshed,
+            refreshStatus = refreshed.refreshStatus,
+            restVerified = restVerified,
+        )
+    }
+
+    private fun backfillUserIdFromStored(
+        credentials: KakaoCredentials?,
+        stored: KakaoCredentials?,
+    ): KakaoCredentials? {
+        if (credentials == null || credentials.userId > 0L || stored == null || stored.userId <= 0L) {
+            return credentials
+        }
+        val currentSuffix = credentials.authorizationSuffix()
+        val storedSuffix = stored.authorizationSuffix()
+        return if (
+            !currentSuffix.isNullOrBlank() &&
+            !storedSuffix.isNullOrBlank() &&
+            currentSuffix == storedSuffix
+        ) {
+            credentials.copy(userId = stored.userId)
+        } else {
+            credentials
+        }
+    }
 
     private fun credentialScore(credentials: KakaoCredentials?): Int {
         if (credentials == null) {
@@ -870,9 +1109,9 @@ object KakaoCli {
 
             기본 흐름:
               bootstrap
-              rooms [--limit 50]
-              read <chatId> [--limit 30]
-              send <chatId> --message "안녕하세요"
+              chats [--all true|false]
+              messages <chatId> [--max-pages 10]
+              rooms [--limit 50] [--query 이름]
 
             세션:
               api-list [--verbose]
@@ -886,10 +1125,13 @@ object KakaoCli {
 
             LOCO:
               login
-              rooms [--limit 50]
+              rooms [--limit 50] [--query 이름] [--exact-match]
               room <chatId>
               read <chatId> [--cursor 0] [--limit 30] [--fetch-all false] [--delay-ms 0]
               send <chatId> --message "안녕하세요" [--allow-open-chat-unsafe]
+              send <chatId> --message "@홍길동 테스트" --mention-user-id 123 --mention-at 1 --mention-len 4
+              send <chatId> --message "ㅎㅇ" --mention-all [--include-self]
+              mention-all-room --title "멋쟁이 2515 클럽" --message "ㅎㅇ"
 
             REST:
               settings
@@ -1112,10 +1354,28 @@ object KakaoCli {
         val diff: JsonObject? = null,
     )
 
+    @Serializable
+    private data class CliMentionAllResult(
+        val success: Boolean,
+        val chatId: Long,
+        val title: String,
+        val mentionedCount: Int,
+        val mentionedUserIds: List<Long>,
+        val composedMessage: String,
+        val response: JsonObject,
+    )
+
     private data class RefreshedCredentialsResult(
         val credentials: KakaoCredentials?,
         val refreshed: Boolean = false,
         val refreshStatus: Long? = null,
+    )
+
+    private data class EvaluatedCandidate(
+        val credentials: KakaoCredentials? = null,
+        val refreshed: Boolean = false,
+        val refreshStatus: Long? = null,
+        val restVerified: Boolean? = null,
     )
 
     private data class ResolvedManualLoginContext(
@@ -1149,6 +1409,18 @@ object KakaoCli {
 
         fun stringOption(name: String): String? =
             options[name]
+
+        fun intListOption(name: String): List<Int> =
+            options[name]
+                ?.split(',')
+                ?.mapNotNull { it.trim().takeIf(String::isNotEmpty)?.toIntOrNull() }
+                .orEmpty()
+
+        fun longListOption(name: String): List<Long> =
+            options[name]
+                ?.split(',')
+                ?.mapNotNull { it.trim().takeIf(String::isNotEmpty)?.toLongOrNull() }
+                .orEmpty()
 
         fun requiredLongPositional(index: Int, field: String): Long =
             positional.getOrNull(index)?.toLongOrNull() ?: error("$field is required")

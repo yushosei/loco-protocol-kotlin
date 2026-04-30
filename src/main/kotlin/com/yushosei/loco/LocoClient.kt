@@ -10,6 +10,9 @@ import com.yushosei.model.LocoServer
 import com.yushosei.logging.ProtocolLogDirection
 import com.yushosei.logging.ProtocolLogStore
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
@@ -301,6 +304,19 @@ class LocoClient(
         }
     }
 
+    fun findChatsByTitle(title: String, exactMatch: Boolean = true): List<LocoChatListing> {
+        val needle = title.trim()
+        require(needle.isNotEmpty()) { "title must not be blank" }
+        return listChats().filter { listing ->
+            val currentTitle = listing.title.trim()
+            if (exactMatch) {
+                currentTitle == needle
+            } else {
+                currentTitle.contains(needle, ignoreCase = true)
+            }
+        }
+    }
+
     fun readMessages(
         chatId: Long,
         cursor: Long?,
@@ -376,23 +392,77 @@ class LocoClient(
         return if (fetchAll) sorted else sorted.takeLast(limit.coerceAtLeast(1))
     }
 
-    fun sendTextMessage(chatId: Long, message: String, allowOpenChatUnsafe: Boolean): JsonObject {
+    fun sendTextMessage(
+        chatId: Long,
+        message: String,
+        mentions: List<Mention> = emptyList(),
+        allowOpenChatUnsafe: Boolean,
+    ): JsonObject {
         val roomInfo = getChatInfo(chatId)
         val chatType = extractChatType(roomInfo)
         if (isOpenChat(chatType) && !allowOpenChatUnsafe) {
             error("sending to open chat is blocked by default; set allowOpenChatUnsafe=true to override")
         }
+        val attachment =
+            mentions
+                .takeIf { it.isNotEmpty() }
+                ?.let(::buildMentionsAttachment)
+                ?: ""
         val response = sendCommand(
             "WRITE",
             BsonSupport.docOf(
                 "chatId" to BsonInt64(chatId),
                 "msgId" to BsonInt32(++nextMessageId),
                 "msg" to BsonString(message),
+                "attachment" to BsonString(attachment),
                 "type" to BsonInt32(1),
                 "noSeen" to BsonBoolean(true),
             ),
         )
         return BsonSupport.toJson(response.body)
+    }
+
+    fun buildMentionAllPayload(
+        chatId: Long,
+        trailingMessage: String,
+        includeSelf: Boolean = false,
+    ): MentionPayload {
+        val targets =
+            getMembers(chatId)
+                .filter { member ->
+                    member.nickname.isNotBlank() &&
+                        (includeSelf || member.userId != credentials.userId)
+                }
+                .distinctBy { it.userId }
+
+        require(targets.isNotEmpty()) { "no members available to mention" }
+
+        val builder = StringBuilder()
+        val mentions = mutableListOf<Mention>()
+
+        targets.forEach { member ->
+            if (builder.isNotEmpty()) {
+                builder.append(' ')
+            }
+            builder.append('@')
+            val start = builder.length
+            builder.append(member.nickname)
+            mentions += Mention(userId = member.userId, at = listOf(start), len = member.nickname.length)
+        }
+
+        val suffix = trailingMessage.trim()
+        if (suffix.isNotEmpty()) {
+            if (builder.isNotEmpty()) {
+                builder.append(' ')
+            }
+            builder.append(suffix)
+        }
+
+        return MentionPayload(
+            message = builder.toString(),
+            mentions = mentions,
+            members = targets,
+        )
     }
 
     fun sendCommand(method: String, body: BsonDocument): LocoPacket {
@@ -595,6 +665,41 @@ class LocoClient(
 
     private fun isOpenChat(type: String): Boolean =
         type == "OpenMultiChat" || type == "OpenDirectChat"
+
+    private fun buildMentionsAttachment(mentions: List<Mention>): String =
+        buildJsonObject {
+            put(
+                "mentions",
+                buildJsonArray {
+                    mentions.forEach { mention ->
+                        add(
+                            buildJsonObject {
+                                put("user_id", JsonPrimitive(mention.userId))
+                                put(
+                                    "at",
+                                    buildJsonArray {
+                                        mention.at.forEach { add(JsonPrimitive(it)) }
+                                    },
+                                )
+                                put("len", JsonPrimitive(mention.len))
+                            },
+                        )
+                    }
+                },
+            )
+        }.toString()
+
+    data class Mention(
+        val userId: Long,
+        val at: List<Int>,
+        val len: Int,
+    )
+
+    data class MentionPayload(
+        val message: String,
+        val mentions: List<Mention>,
+        val members: List<LocoChatMember>,
+    )
 
     enum class LocoTransportType(val logName: String) {
         TLS("TLS"),

@@ -320,10 +320,40 @@ data class LocoReadRequest(
 )
 
 @Serializable
+data class LocoMentionRequest(
+    val userId: Long,
+    val at: List<Int>,
+    val len: Int,
+)
+
+@Serializable
 data class LocoSendMessageRequest(
     val chatId: Long,
     val message: String,
+    val mentions: List<LocoMentionRequest> = emptyList(),
+    val mentionAll: Boolean = false,
+    val includeSelf: Boolean = false,
     val allowOpenChatUnsafe: Boolean = false,
+)
+
+@Serializable
+data class LocoSendMentionAllRequest(
+    val chatTitle: String,
+    val message: String = "ㅎㅇ",
+    val exactMatch: Boolean = true,
+    val includeSelf: Boolean = false,
+    val allowOpenChatUnsafe: Boolean = false,
+)
+
+@Serializable
+data class LocoSendMentionAllResponse(
+    val success: Boolean,
+    val chatId: Long,
+    val title: String,
+    val mentionedCount: Int,
+    val mentionedUserIds: List<Long>,
+    val composedMessage: String,
+    val response: JsonObject,
 )
 
 @Serializable

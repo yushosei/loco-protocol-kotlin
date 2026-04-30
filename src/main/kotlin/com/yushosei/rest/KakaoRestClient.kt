@@ -36,6 +36,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -977,7 +978,22 @@ class KakaoRestClient(
                     setBody(body.orEmpty())
                 }
         }
-        return parseJsonObject(response.bodyAsText())
+        val payload = parseJsonObject(response.bodyAsText())
+        if (response.status.value !in 200..299) {
+            val normalizedStatus =
+                payload["status"]?.jsonPrimitive?.longOrNull
+                    ?: when (payload["reason"]?.jsonPrimitive?.contentOrNull) {
+                        "UNAUTHENTICATED" -> STATUS_EXPIRED
+                        else -> -response.status.value.toLong()
+                    }
+            return JsonObject(
+                payload.toMutableMap().apply {
+                    put("status", JsonPrimitive(normalizedStatus))
+                    put("httpStatus", JsonPrimitive(response.status.value))
+                },
+            )
+        }
+        return payload
     }
 
     enum class HttpMethod {
